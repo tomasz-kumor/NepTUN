@@ -9,6 +9,46 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, S
 use std::str::FromStr;
 use std::sync::Arc;
 
+/// Cipher algorithms that a peer may advertise and that this implementation supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CipherAlgorithm {
+    Chacha20Poly1305,
+    Aegis256,
+    Aegis256x2,
+    Aegis256x4,
+}
+
+impl CipherAlgorithm {
+    /// Return the canonical wire name for this cipher as defined in the NepTUN UAPI extension.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CipherAlgorithm::Chacha20Poly1305 => "chacha20poly1305",
+            CipherAlgorithm::Aegis256 => "aegis256",
+            CipherAlgorithm::Aegis256x2 => "aegis256x2",
+            CipherAlgorithm::Aegis256x4 => "aegis256x4",
+        }
+    }
+
+    /// Parse a single cipher token received over the wire.
+    /// Matching is case-insensitive. Returns `None` for unrecognised tokens
+    /// so the caller can skip them.
+    fn from_token(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "chacha20poly1305" => Some(CipherAlgorithm::Chacha20Poly1305),
+            "aegis256" => Some(CipherAlgorithm::Aegis256),
+            "aegis256x2" => Some(CipherAlgorithm::Aegis256x2),
+            "aegis256x4" => Some(CipherAlgorithm::Aegis256x4),
+            _ => None,
+        }
+    }
+
+    /// Parse a comma-separated list of cipher names and return all recognised
+    /// ones as a `Vec`. Unrecognised tokens are silently skipped.
+    pub fn parse_list(supported: &str) -> Vec<Self> {
+        supported.split(',').filter_map(Self::from_token).collect()
+    }
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use crate::device::modify_skt_buffer_size;
 use crate::device::{AllowedIps, Error, MakeExternalNeptun};
@@ -35,6 +75,10 @@ pub struct Peer {
     allowed_ips: RwLock<AllowedIps<()>>,
     preshared_key: RwLock<Option<[u8; 32]>>,
     protect: Arc<dyn MakeExternalNeptun>,
+    supported_ciphers: RwLock<Option<Vec<CipherAlgorithm>>>,
+    /// Cipher algorithm selected during `set=1` negotiation.
+    /// `None` means the peer did not advertise `supported_ciphers`.
+    selected_cipher: RwLock<Option<CipherAlgorithm>>,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -89,6 +133,8 @@ impl Peer {
             allowed_ips: RwLock::new(allowed_ips.iter().map(|ip| (ip, ())).collect()),
             preshared_key: RwLock::new(preshared_key),
             protect,
+            supported_ciphers: RwLock::new(None),
+            selected_cipher: RwLock::new(None),
         }
     }
 
@@ -210,6 +256,22 @@ impl Peer {
         *self.preshared_key.write() = key;
 
         self.tunnel.lock().set_preshared_key(key);
+    }
+
+    pub fn supported_ciphers(&self) -> Option<Vec<CipherAlgorithm>> {
+        self.supported_ciphers.read().clone()
+    }
+
+    pub fn set_supported_ciphers(&self, ciphers: Vec<CipherAlgorithm>) {
+        *self.supported_ciphers.write() = Some(ciphers);
+    }
+
+    pub fn selected_cipher(&self) -> Option<CipherAlgorithm> {
+        *self.selected_cipher.read()
+    }
+
+    pub fn set_selected_cipher(&self, cipher: CipherAlgorithm) {
+        *self.selected_cipher.write() = Some(cipher);
     }
 
     pub fn index(&self) -> u32 {

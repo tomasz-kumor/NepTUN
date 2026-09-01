@@ -5,6 +5,7 @@
 use super::dev_lock::LockReadGuard;
 use super::drop_privileges::get_saved_ids;
 use super::{AllowedIP, Device, Error, SocketAddr};
+use crate::device::peer::CipherAlgorithm;
 use crate::device::Action;
 use crate::serialization::KeyBytes;
 use crate::x25519;
@@ -174,6 +175,15 @@ fn api_get<R: Read, W: Write>(
             writeln!(writer, "preshared_key={}", encode_hex(key));
         }
 
+        if let Some(ref ciphers) = peer.supported_ciphers() {
+            let list: Vec<&str> = ciphers.iter().map(|c| c.as_str()).collect();
+            writeln!(writer, "supported_ciphers={}", list.join(","));
+        }
+
+        if let Some(cipher) = peer.selected_cipher() {
+            writeln!(writer, "selected_cipher={}", cipher.as_str());
+        }
+
         if let Some(keepalive) = keepalive {
             writeln!(writer, "persistent_keepalive_interval={}", keepalive);
         }
@@ -317,6 +327,8 @@ fn api_set_peer<R: Read>(
     let mut public_key = pub_key;
     let mut preshared_key = None;
     let mut allowed_ips: Vec<AllowedIP> = vec![];
+    let mut supported_ciphers: Option<Vec<CipherAlgorithm>> = None;
+    let mut selected_cipher: Option<CipherAlgorithm> = None;
     while reader.read_line(&mut cmd).is_ok() {
         cmd.pop(); // remove newline if any
         if cmd.is_empty() {
@@ -330,6 +342,17 @@ fn api_set_peer<R: Read>(
                 keepalive,
                 preshared_key,
             );
+            // Persist the negotiated cipher on the peer if one was selected.
+
+            if let Some(peer) = d.peers.get(&public_key) {
+                if let Some(ciphers) = supported_ciphers {
+                    peer.set_supported_ciphers(ciphers);
+                }
+
+                if let Some(cipher) = selected_cipher {
+                    peer.set_selected_cipher(cipher);
+                }
+            }
             allowed_ips.clear(); //clear the vector content after update
             return res.and(Ok(0)).unwrap_or(EINVAL);
         }
@@ -371,6 +394,22 @@ fn api_set_peer<R: Read>(
                     Ok(ip) => allowed_ips.push(ip),
                     Err(_) => return EINVAL,
                 },
+                "supported_ciphers" => {
+                    let parsed = CipherAlgorithm::parse_list(val);
+                    selected_cipher = parsed.first().copied();
+                    match selected_cipher {
+                        Some(cipher) => tracing::info!(
+                            supported_ciphers = val,
+                            selected_cipher = cipher.as_str(),
+                            "Cipher negotiation: peer advertised ciphers, selected cipher"
+                        ),
+                        None => tracing::warn!(
+                            supported_ciphers = val,
+                            "Cipher negotiation: peer advertised ciphers but none are supported"
+                        ),
+                    }
+                    supported_ciphers = Some(parsed);
+                }
                 "public_key" => {
                     // Indicates a new peer section. Commit changes for current peer, and continue to next peer
                     let res = d.update_peer(
@@ -385,6 +424,18 @@ fn api_set_peer<R: Read>(
                     );
                     if res.is_err() {
                         return EINVAL;
+                    }
+                    // Persist the negotiated cipher for the peer we just committed.
+                    if let Some(peer) = d.peers.get(&public_key) {
+                        if let Some(ciphers) = supported_ciphers.take() {
+                            peer.set_supported_ciphers(ciphers);
+                        }
+                        if let Some(cipher) = selected_cipher.take() {
+                            peer.set_selected_cipher(cipher);
+                        }
+                    } else {
+                        supported_ciphers = None;
+                        selected_cipher = None;
                     }
                     replace_ips = false;
                     endpoint = None;
